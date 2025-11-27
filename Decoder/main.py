@@ -14,7 +14,7 @@ from Lib.scope import RigolDualScopes
 # ============================================================
 
 GATE_TYPE = "AND"
-INPUT_HEATERS = [37, 38]       # Input A, B heaters
+INPUT_HEATERS = [27, 28]       # Input A, B heaters
 V_LOW = 0.1 # 0 doesnt work for some reason
 V_HIGH = 4.9
 
@@ -217,7 +217,7 @@ class LogicGateOptimizer:
     # ========================================================
     def optimize(self, iterations=20, candidates_per_iter=300):
 
-        self.initial_sampling(20)
+        self.initial_sampling(2)
 
         for it in range(iterations):
             print(f"\n=== BO Iteration {it+1}/{iterations} ===")
@@ -247,9 +247,77 @@ class LogicGateOptimizer:
                 print(f"   → Score {score:.2f}")
 
         print("\n=== Optimization Done ===")
+        self.test_best_configuration()
         print(f"Best Score: {self.best_score:.2f}")
-        print("Best Config:")
-        print(self.best_config)
+       
+
+
+    # ========================================================
+    #  Final test of best configuration
+    # ========================================================
+    def test_best_configuration(self):
+        if self.best_config is None:
+            print("\n[FINAL TEST] No best configuration available.")
+            return
+
+        print("\n=== FINAL TEST OF BEST CONFIGURATION ===")
+
+        results = []
+        high_vals = []
+        low_vals = []
+
+        for idx, (a, b) in enumerate(INPUT_COMBINATIONS):
+
+            cfg = self.best_config.copy()
+            cfg[INPUT_HEATERS[0]] = a
+            cfg[INPUT_HEATERS[1]] = b
+
+            self.set_heaters(cfg)
+            time.sleep(0.2)
+
+            val = self.measure_output()
+            val = float(val) if val is not None else np.nan
+
+            expected = "HIGH" if self.truth[idx] == 1 else "LOW"
+            results.append((a, b, expected, val))
+
+            if self.truth[idx] == 1:
+                high_vals.append(val)
+            else:
+                low_vals.append(val)
+
+        # ---- PRINT TABLE ----
+        print("\nInput A | Input B | Expected |  Measured Output (V)")
+        print("------------------------------------------------------")
+        for r in results:
+            print(f"{r[0]:7.2f} | {r[1]:7.2f} | {r[2]:8s} | {r[3]:18.4f}")
+
+        # ---- EXTINCTION RATIO ----
+        if high_vals and low_vals:
+            min_high = min(high_vals)
+            max_low  = max(low_vals)
+            sep = min_high - max_low
+
+            if sep > 0:
+                er_linear = min_high / max_low
+                er_db = 10 * np.log10(er_linear)
+                print("\nLogic gate working ✓")
+                print(f"  Worst-case separation: {sep:.4f} V")
+                print(f"  Extinction ratio:      {er_db:.2f} dB")
+                print(f"  min(HIGH) = {min_high:.4f} V")
+                print(f"  max(LOW)  = {max_low:.4f} V")
+            else:
+                print("\n⚠️  Logic levels overlap — gate not reliable.")
+                print(f"  min(HIGH) = {min_high:.4f} V")
+                print(f"  max(LOW)  = {max_low:.4f} V")
+                print(f"  Overlap   = {-sep:.4f} V")
+
+        # ---- PRETTY CONFIG PRINT ----
+        print("\n=== FINAL HEATER CONFIGURATION ===")
+        sorted_items = sorted(self.best_config.items(), key=lambda x: x[0])
+        for h, v in sorted_items:
+            print(f"Heater {h:2d}: {float(v):.4f} V")
+
 
 
     # ========================================================
@@ -267,7 +335,7 @@ class LogicGateOptimizer:
 def main():
     opt = LogicGateOptimizer(GATE_TYPE)
     try:
-        opt.optimize(iterations=20)
+        opt.optimize(iterations=10)
     finally:
         opt.cleanup()
 
