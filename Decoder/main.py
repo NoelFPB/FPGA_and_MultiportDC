@@ -12,6 +12,8 @@ from Lib.scope import RigolDualScopes
 # ============================================================
 #  CONFIGURATION
 # ============================================================
+# The heaters that you can use as inputs are 28,29,30,31,32,33,334
+
 
 GATE_TYPE = "AND"
 INPUT_HEATERS = [27, 28]       # Input A, B heaters
