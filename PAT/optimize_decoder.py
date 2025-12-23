@@ -5,15 +5,15 @@ import time
 from Lib.DualBoard import DualAD5380Controller
 from Lib.scope import RigolDualScopes
 # Ensure these files exist and have the classes we discussed
-from PAT.train_model import ChipModel 
-from decoder_logic import generate_full_truth_table
+from PAT.train_decoder import ChipModel 
+from PAT.decoder_logic import generate_full_truth_table
 
 class PATDecoderOptimizer:
-    def __init__(self, model_path="chip_model_6ch.pth"):
+    def __init__(self, model_path="decoder_model.pth"):
         # 5 Input Pins: OP0, OP1, OP2, OP3, CFLAG
-        self.INPUT_HEATERS = [27, 28, 29, 30, 31] 
+        self.INPUT_HEATERS = [42, 43, 44, 45, 46] 
         # The other 35 heaters are trainable weights
-        self.opt_indices = [h for h in range(40) if h not in self.INPUT_HEATERS]
+        self.opt_indices = [h for h in range(49) if h not in self.INPUT_HEATERS]
         
         # Load the 6-Output Digital Model
         print(f"Loading Digital Twin from {model_path}...")
@@ -33,7 +33,7 @@ class PATDecoderOptimizer:
         
         # Trainable Parameters (35 Heaters)
         self.heater_params = torch.nn.Parameter(
-            torch.rand(35) * (4.1 - 0.5) + 0.5
+            torch.rand(44) * (4.1 - 0.5) + 0.5
         )
         
         # Optimizer
@@ -48,12 +48,12 @@ class PATDecoderOptimizer:
         
         for i in range(20):
             # Random config
-            for h in range(40):
+            for h in range(49):
                 self.controller.set(h, np.random.uniform(0.5, 4.1))
             time.sleep(0.01)
             
             read = self.scopes.read_many(avg=1) 
-            if read and len(read) >= 6:
+            if read is not None and len(read) >= 6:
                 vals[i, :] = read[0:6]
             
         # Determine targets per channel
@@ -101,8 +101,8 @@ class PATDecoderOptimizer:
             for idx in batch_indices:
                 logic_bits = logic_inputs_np[idx] 
                 
-                # Construct full 40-heater config
-                full_config = np.zeros(40)
+                # Construct full 49-heater config
+                full_config = np.zeros(49)
                 
                 # A. Fill Trainable Heaters
                 for k, h_idx in enumerate(self.opt_indices):
@@ -135,7 +135,7 @@ class PATDecoderOptimizer:
             
             # 2. Re-construct Input Tensor for Digital Model
             # We must build this using Torch Tensors to keep the gradient graph alive
-            batch_input_tensor = torch.zeros(batch_size, 40)
+            batch_input_tensor = torch.zeros(batch_size, 49)
             
             # Fill trainable columns (connects to self.heater_params)
             for k, h_idx in enumerate(self.opt_indices):
@@ -181,7 +181,7 @@ class PATDecoderOptimizer:
 
 if __name__ == "__main__":
     # Ensure chip_model_6ch.pth exists first!
-    opt = PATDecoderOptimizer(model_path="chip_model_6ch.pth")
+    opt = PATDecoderOptimizer(model_path="decoder_model.pth")
     try:
         opt.optimize(steps=200)
     except KeyboardInterrupt:
