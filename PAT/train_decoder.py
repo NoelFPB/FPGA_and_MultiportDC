@@ -5,6 +5,8 @@ import numpy as np
 import time
 import pyvisa 
 
+#MAYBE OBSOLETE
+
 # Import your hardware libraries
 from Lib.DualBoard import DualAD5380Controller
 from Lib.scope import RigolDualScopes
@@ -22,12 +24,12 @@ class ChipModel(nn.Module):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(num_heaters, 128),
-            nn.ReLU(),
+            nn.Tanh(), # Tanh is smoother than ReLU for interference curves
             nn.Linear(128, 128),
-            nn.ReLU(),
+            nn.Tanh(),
             nn.Linear(128, 128),
-            nn.ReLU(),
-            nn.Linear(128, num_outputs) # Output is now a vector of size 6
+            nn.Tanh(),
+            nn.Linear(128, num_outputs)
         )
 
     def forward(self, x):
@@ -68,22 +70,29 @@ class ChipTrainer:
         X_data = []
         y_data = []
         
+        # Inside collect_data
         for i in range(n_samples):
-            # 1. Random Configuration
-            config = np.random.uniform(0.1, 4.9, NUM_HEATERS)
+            if i < n_samples // 2:
+                # 50% purely random (good for general physics)
+                config = np.random.uniform(0.1, 4.9, NUM_HEATERS)
+            else:
+                # 50% "Biased" samples:
+                # Keep 42 trainable heaters random, but force the 5 inputs 
+                # to be exactly 0.5V or 4.1V
+                config = np.random.uniform(0.1, 4.9, NUM_HEATERS)
+                for h_inp in [42, 43, 44, 45, 46]:
+                    config[h_inp] = 0.5 if np.random.random() > 0.5 else 4.1
             
             # 2. Hardware Set
             for h, v in enumerate(config):
                 self.controller.set(h, v)
             
             # 3. Thermal Sleep
-            time.sleep(0.05) 
+            time.sleep(0.2) 
             
             # 4. Read All Channels
             try:
-                # Returns list of 8 floats (if 2 scopes x 4 channels)
-                _ = self.scopes.read_many(avg=1)
-                
+                # Returns list of 8 floats (if 2 scopes x 4 channels)    
                 vals = self.scopes.read_many(avg=1)
                 
                 if vals is not None and len(vals) > max(self.target_indices):
@@ -104,35 +113,50 @@ class ChipTrainer:
         return np.array(X_data), np.array(y_data)
 
     def train_and_save(self, path="decoder_model.pth"):
-        # Collect Data
-        X, y = self.collect_data(n_samples=2500) # Increased samples for harder problem
-        
-        if len(X) == 0:
-            print("ERROR: No data collected. Exiting.")
-            return
-
-        # Convert to Tensors
-        tensor_x = torch.Tensor(X)
-        tensor_y = torch.Tensor(y) # Shape will be (N, 6) automatically
-        
-        print(f"Training on {len(X)} samples. Input: {NUM_HEATERS}, Output: {NUM_OUTPUTS}")
-        
-        optimizer = optim.Adam(self.model.parameters(), lr=1e-3)
-        loss_fn = nn.MSELoss() # Mean Squared Error handles vectors perfectly
-        
-        self.model.train()
-        for epoch in range(1000): # Increased epochs for multi-output convergence
-            optimizer.zero_grad()
-            pred = self.model(tensor_x)
-            loss = loss_fn(pred, tensor_y)
-            loss.backward()
-            optimizer.step()
+            # 1. Collect Data
+            X, y = self.collect_data(n_samples=10000)
             
-            if epoch % 100 == 0:
-                print(f"Epoch {epoch} Loss: {loss.item():.6f}")
+            # 2. Split indices 80/20
+            indices = np.random.permutation(len(X))
+            split = int(0.8 * len(X))
+            train_idx, val_idx = indices[:split], indices[split:]
+            
+            # 3. Create Tensors (Scaling input by 5.0, keeping output raw Volts)
+            tx_train = torch.Tensor(X[train_idx]) / 5.0
+            ty_train = torch.Tensor(y[train_idx])
+            
+            tx_val = torch.Tensor(X[val_idx]) / 5.0
+            ty_val = torch.Tensor(y[val_idx])
+            
+            print(f"Training on {len(train_idx)} samples, Validating on {len(val_idx)} samples.")
+            
+            optimizer = optim.Adam(self.model.parameters(), lr=1e-3)
+            loss_fn = nn.MSELoss()
+            
+            # --- TRAINING LOOP ---
+            for epoch in range(500):
+                # A. Training Step
+                self.model.train()
+                optimizer.zero_grad()
                 
-        torch.save(self.model.state_dict(), path)
-        print(f"Multi-output model saved to {path}")
+                train_pred = self.model(tx_train)
+                train_loss = loss_fn(train_pred, ty_train)
+                
+                train_loss.backward()
+                optimizer.step()
+                
+                # B. Validation Step (Every 100 epochs)
+                if epoch % 50 == 0:
+                    self.model.eval() # Set to evaluation mode
+                    with torch.no_grad(): # Disable gradient calculation for speed/memory
+                        val_pred = self.model(tx_val)
+                        val_loss = loss_fn(val_pred, ty_val)
+                    
+                    print(f"Epoch {epoch:4d} | Train Loss: {train_loss.item():.6f} | Val Loss: {val_loss.item():.6f}")
+
+            # 4. Save
+            torch.save(self.model.state_dict(), path)
+            print(f"Multi-output model saved to {path}")
 
     def cleanup(self):
         print("Closing connection...")
