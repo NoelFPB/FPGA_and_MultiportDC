@@ -183,13 +183,25 @@ class RigolDualScopes:
                 samples = [v for v in samples if np.isfinite(v)]
                 out.append(float(np.mean(samples)) if samples else np.nan)
             return out
+    
+    def reset_statistics(self):
+        """Clears the measurement history on both scopes."""
+        try:
+            self.scope1.write(':MEASure:STATistic:RESet')
+            self.scope2.write(':MEASure:STATistic:RESet')
+        except Exception as e:
+            print(f"[SCOPE] Warning: Failed to reset stats: {e}")
 
     def read_many(self, avg=1):
         """
-        Returns values in GUARANTEED order:
-          [scope1 channels ... , scope2 channels ...]
-        Reads both scopes in parallel to cut wall time roughly in half.
+        Modified to include a buffer clear before reading.
         """
+        # 1. CRITICAL: Clear the buffer so we don't read the previous heater state
+        self.reset_statistics()
+        
+        # 2. OPTIONAL: Small delay to let the scope start fresh
+        time.sleep(0.05) 
+        
         with ThreadPoolExecutor(max_workers=2) as ex:
             f1 = ex.submit(self._read_scope_channels, self.scope1, self.channels1, avg)
             f2 = ex.submit(self._read_scope_channels, self.scope2, self.channels2, avg)

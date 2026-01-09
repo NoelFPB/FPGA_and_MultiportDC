@@ -32,7 +32,7 @@ def collect():
                 controller.set(h, v)
             
             # 3. Wait for Thermal Equilibrium
-            time.sleep(0.4) 
+            time.sleep(0.2) 
             
             vals = scopes.read_many(avg=1)
             
