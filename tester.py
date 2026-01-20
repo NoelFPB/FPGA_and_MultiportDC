@@ -27,14 +27,14 @@ def get_expected_logic(op3, op2, op1, op0, cflag):
     return out
 
 class DecoderTester:
-    def __init__(self, config_file="decoder_config.json"):
+    def __init__(self, config_file="decoder_hybrid_best.json"):
         # Hardware
         self.controller = DualAD5380Controller()
         self.scopes = RigolDualScopes(channels_scope1=[1,2,3,4], channels_scope2=[1,2])
         
         # Pin Definitions
-        self.INPUT_HEATERS = [42, 43, 44, 45, 46]
-        self.opt_indices = [h for h in range(49) if h not in self.INPUT_HEATERS]
+        self.INPUT_HEATERS =[15, 16, 17, 18, 19] 
+        self.opt_indices = [h for h in range(21) if h not in self.INPUT_HEATERS]
         
         # Load Config
         try:
@@ -95,7 +95,7 @@ class DecoderTester:
             # 3. Digitalize (Thresholding)
             # You might need to verify which channel is which!
             # Assuming: Scope1_CH1=SelB, S1_CH2=SelA, S1_CH3=L0...
-            threshold = 3.0 # Anything above 1.5V is a '1'
+            threshold = 3 # Anything above 1.5V is a '1'
             measured_logic = [1 if v > threshold else 0 for v in vals]
             
             # 4. Compare

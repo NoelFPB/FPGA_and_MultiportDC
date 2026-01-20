@@ -1,60 +1,24 @@
-import matplotlib.pyplot as plt
 import numpy as np
-# Load your data
+
+# Load the dataset you uploaded
 data = np.load("chip_dataset.npz")
-y = data['y']
-
-# Check the distribution
-plt.hist(y.flatten(), bins=50)
-plt.title("Distribution of Scope Voltages")
-plt.xlabel("Volts")
-plt.ylabel("Frequency")
-plt.show()
-
-print(f"Standard Deviation of data: {np.std(y):.4f}")
-
-
-data = np.load("chip_dataset.npz")
-y = data['y']
-
-# Split the data into the beginning, middle, and end of your lab session
-start_mean = np.mean(y[:1000])
-mid_mean = np.mean(y[20000:21000])
-end_mean = np.mean(y[-1000:])
-
-print(f"Mean Voltage (Start): {start_mean:.4f}V")
-print(f"Mean Voltage (Mid):   {mid_mean:.4f}V")
-print(f"Mean Voltage (End):   {end_mean:.4f}V")
-
-drift = abs(start_mean - end_mean)
-print(f"Total Session Drift: {drift:.4f}V")
-
-from scipy.stats import pearsonr
-
 X = data['X']
-print(X)
 y = data['y']
 
-# Check correlation between total heater power and the first scope channel
-# We use the absolute value because interference can be positive or negative
-corr, _ = pearsonr(np.sum(X, axis=1), y[:, 0])
-print(f"Input-Output Correlation: {corr:.4f}")
+print("=== DATASET INSPECTION ===")
+print(f"Total Samples: {len(X)}")
+print(f"X (Heaters) Shape: {X.shape} | y (Scope) Shape: {y.shape}")
 
-# Check for unique outputs
-unique_outputs = len(np.unique(y.round(decimals=4), axis=0))
-print(f"Unique Samples: {unique_outputs} out of {len(y)}")
+# Check Input Voltages
+print(f"\nInput Voltage (X) Range: {X.min():.3f}V to {X.max():.3f}V")
+print(f"X Mean: {X.mean():.3f}V | X Std: {X.std():.3f}V")
 
+# Check Output Voltages (Scope)
+print(f"\nOutput Voltage (y) Range: {y.min():.3f}V to {y.max():.3f}V")
+print(f"y Mean: {y.mean():.3f}V | y Std: {y.std():.3f}V")
 
-import numpy as np
-data = np.load("chip_dataset.npz")
-X, y = data['X'], data['y']
-
-# Check correlation for each of the 6 outputs separately
-for i in range(6):
-    c = np.corrcoef(np.sum(X, axis=1), y[:, i])[0, 1]
-    print(f"Global Correlation Output Ch{i}: {c:.6f}")
-
-    # Check if Heater #42 (an input) has any individual correlation
-h_idx = 3 
-c_single = np.corrcoef(X[:, h_idx], y[:, 0])[0, 1]
-print(f"Single Heater (#42) Correlation: {c_single:.6f}")
+# Physical Check: If X.max() is < 1.0, your data is already scaled/normalized!
+if X.max() < 1.0:
+    print("\n⚠️ WARNING: X data appears to be pre-scaled. The sin(V^2) logic will break.")
+if y.std() < 0.1:
+    print("⚠️ WARNING: y data has very low variation. The scope might not have captured interference.")

@@ -5,7 +5,7 @@ from Lib.DualBoard import DualAD5380Controller
 from Lib.scope import RigolDualScopes
 
 # --- CONFIGURATION ---
-NUM_SAMPLES = 5000
+NUM_SAMPLES = 20000
 NUM_HEATERS = 49
 SCOPE_INDICES = [0, 1, 2, 3, 4, 5] 
 INPUT_HEATER_INDICES = [42, 43, 44, 45, 46]
@@ -34,7 +34,7 @@ def collect():
             # 3. Wait for Thermal Equilibrium
             time.sleep(0.2) 
             
-            vals = scopes.read_many(avg=1)
+            vals = scopes.read_many(avg=3)
             
             if vals is not None and len(vals) > max(SCOPE_INDICES):
                 current_outputs = [vals[idx] for idx in SCOPE_INDICES]

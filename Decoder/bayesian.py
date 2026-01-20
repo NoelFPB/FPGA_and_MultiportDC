@@ -1,95 +1,36 @@
 import time
 import numpy as np
 import json
+import warnings
 from scipy.stats import qmc
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import Matern, WhiteKernel, ConstantKernel
+from sklearn.exceptions import ConvergenceWarning
 from Lib.DualBoard import DualAD5380Controller
 from Lib.scope import RigolDualScopes
 
+# Silencing the length-scale warnings to keep the console clean
+warnings.filterwarnings("ignore", category=ConvergenceWarning)
+USE = 16
 # ============================================================
 #   CONFIGURATION
 # ============================================================
+INPUT_HEATERS = [15, 16, 17, 18, 19] 
+MODIFIABLE_HEATERS = [h for h in range(21) if h not in INPUT_HEATERS]
 
-# Input Pins (OP0, OP1, OP2, OP3, CFLAG)
-INPUT_HEATERS = [42, 43, 44, 45, 46] 
-
-# Trainable Background Heaters (All others)
-MODIFIABLE_HEATERS = [h for h in range(49) if h not in INPUT_HEATERS]
-
-V_LOW_LOGIC = 0.5   # Voltage sent to Input Heaters for Logic 0
-V_HIGH_LOGIC = 4.1  # Voltage sent to Input Heaters for Logic 1
-
-# 6-channel readout: (scope1 CH1..CH4, scope2 CH1..CH2)
-# We assume indices 0-5 map to the decoder outputs [SelB, SelA, L0, L1, L2, L3]
+V_LOW_LOGIC = 0.1   
+V_HIGH_LOGIC = 4.1  
 OUTPUT_CHANNELS = 6 
 
 # ============================================================
-#   DECODER LOGIC (Truth Table)
+#   DECODER LOGIC (8 Instructions)
 # ============================================================
-
-def get_decoder_target(op3, op2, op1, op0, cflag):
-    """ Returns the expected index (0-5) that should be HIGH. Returns -1 if ALL LOW. """
-    # 0000: ADD A, Im -> L0 (Index 2)
-    if   (op3==0 and op2==0 and op1==0 and op0==0): return 2
-    # 0001: MOV A, B  -> SelA (Index 1)
-    elif (op3==0 and op2==0 and op1==0 and op0==1): return 1
-    # 0010: IN A      -> L1 (Index 3)
-    elif (op3==0 and op2==0 and op1==1 and op0==0): return 3
-    # 0011: MOV A, Im -> L1 (Index 3) - Wait, logic says H,H,H... assuming L1 dominates or check logic?
-    # Let's stick to the STRICT single-hot logic for optimization to avoid ambiguity.
-    # If your logic table has multiple HIGHs, we maximize the MINIMUM of them.
-    # For this BO, let's test the CLEANEST unique instructions.
-    pass
-
-    # Simplified Test Set: The 10 Unique Instructions
-    # format: (op3, op2, op1, op0, cflag, expected_output_index)
-    # expected_index: 0=SelB, 1=SelA, 2=L0, 3=L1, 4=L2, 5=L3
-    return [
-        (0,0,0,0,0, 2), # ADD A -> L0
-        (0,0,0,1,0, 1), # MOV A,B -> SelA
-        (0,0,1,0,0, 3), # IN A -> L1
-        (0,1,0,0,0, 4), # MOV B,A -> L2 (Wait, check logic...)
-        # Let's define the test suite manually to match your Python logic EXACTLY
-    ]
-
-def get_test_suite():
-    """
-    Returns list of tuples: (inputs_list, expected_high_indices)
-    inputs_list = [op3, op2, op1, op0, c]
-    expected_high_indices = list of indices [0..5] that should be HIGH
-    """
-    tests = []
-    # 32 combinations is too slow for BO. We test the 10 valid instructions.
-    # Code mapping: op3, op2, op1, op0, c
-    
-    # 1. ADD A, Im (00000) -> L0 High (Idx 2)
-    tests.append(([0,0,0,0,0], [2]))
-    
-    # 2. MOV A, B (00010) -> SelA High (Idx 1) (Ignoring logic overlap for now, focusing on unique winner)
-    tests.append(([0,0,0,1,0], [1, 2])) # Based on your table: L, H, H, L... -> SelA & L0
-    
-    # Actually, to make BO robust, let's just use the python function you provided
-    # and maximize the gap between (Lowest High) and (Highest Low).
-    
-    # We will generate a subset of 10 random instructions + the 10 valid ones each step?
-    # No, deterministic is better. Let's pick the 8 most distinct instructions.
-    
-    batch = [
-        (0,0,0,0,0), # ADD A
-        (0,0,0,1,0), # MOV A, B
-        (0,0,1,0,0), # IN A
-        (0,1,0,0,0), # MOV B, A
-        (0,1,0,1,0), # ADD B, Im
-        (0,1,1,0,0), # IN B
-        (1,0,0,1,0), # OUT B
-        (1,0,1,1,0)  # OUT Im
-    ]
-    return batch
+def get_test_suite():    
+    return [(0,0,0,0,0), (0,0,0,1,0), (0,0,1,0,0), (0,1,0,0,0), 
+            (0,1,0,1,0), (0,1,1,0,0), (1,0,0,1,0), (1,0,1,1,0)]
 
 def get_expected_logic(op3, op2, op1, op0, c):
-    """ Re-implementation of your logic function for the scorer """
-    L, H = 0, 1 # Logic levels
+    L, H = 0, 1
     out = [L, L, L, L, L, L] 
     if   (op3==0 and op2==0 and op1==0 and op0==0): out = [L, L, H, L, L, L]
     elif (op3==0 and op2==0 and op1==0 and op0==1): out = [L, H, H, L, L, L]
@@ -103,198 +44,190 @@ def get_expected_logic(op3, op2, op1, op0, c):
     elif (op3==1 and op2==0 and op1==1 and op0==1): out = [L, H, L, L, H, L]
     return out
 
-# ============================================================
-#   MAIN OPTIMIZER CLASS
-# ============================================================
-
-class DecoderBO:
+class HybridDecoderBO:
     def __init__(self):
-        print("=== Initializing Decoder Bayesian Optimizer ===")
-        
-        # Hardware interfaces
+        print("=== Initializing Hybrid 44-Heater Optimizer ===")
         self.controller = DualAD5380Controller()
-        # Scope 1 (4ch) + Scope 2 (2ch)
         self.scopes = RigolDualScopes(channels_scope1=[1,2,3,4], channels_scope2=[1,2])
-
-        # BO Storage
-        self.X = []
-        self.y = []
-        self.best_config = None
-        self.best_score = -1e9
-        
-        # Test Suite
         self.test_ops = get_test_suite()
 
-    # ========================================================
-    #  Calibration
-    # ========================================================
-    def calibrate(self):
-        print("Calibrating channel ranges...", end="")
-        vals = np.zeros((15, 6))
-        for i in range(15):
-            for h in range(49): self.controller.set(h, np.random.uniform(0.1, 4.9))
-            time.sleep(0.02)
-            read = self.scopes.read_many(avg=1)
-            if read is not None and len(read) >= 6: 
-                vals[i,:] = read[0:6]
-            else:
-                # If read fails, just duplicate the previous row (or 0) to avoid crash
-                if i > 0: vals[i,:] = vals[i-1,:]
-        
-        self.v_min = np.min(vals, axis=0)
-        self.v_max = np.max(vals, axis=0)
-        print(" Done.")
-        for ch in range(6):
-            print(f"  CH{ch}: {self.v_min[ch]:.2f}V - {self.v_max[ch]:.2f}V")
+        self.X, self.y = [], []
+        self.best_config, self.best_score = None, -1e9
 
-    # ========================================================
-    #  Evaluate Configuration
-    # ========================================================
     def evaluate(self, bg_weights):
-        """
-        bg_weights: List/Array of weights for MODIFIABLE_HEATERS
-        Returns: Score (Higher is better)
-        """
         # 1. Apply Background Weights
         for i, h in enumerate(MODIFIABLE_HEATERS):
             self.controller.set(h, float(bg_weights[i]))
+        time.sleep(0.1) 
         
-        # 2. Loop through test instructions
-        margins = []
+        # --- DEFINE TARGET LOGIC LEVELS ---
+        V_OH_TARGET = 3.0  # Target for Logic 1 (Minimum)
+        V_OL_TARGET = 2.0  # Target for Logic 0 (Maximum)
+        GAP_TARGET = V_OH_TARGET - V_OL_TARGET # Target separation (2.5V)
         
-        for ops in self.test_ops:
-            op3, op2, op1, op0, c = ops
-            
-            # Set Inputs
-            inp_vals = [op3, op2, op1, op0, c]
-            for k, h_inp in enumerate(INPUT_HEATERS):
-                v = V_LOW_LOGIC if inp_vals[k] == 0 else V_HIGH_LOGIC
-                self.controller.set(h_inp, v)
-            
-            time.sleep(0.05) # Fast settling
-            
-            # Measure
-            read = self.scopes.read_many(avg=1)
-            if read is None or len(read) < 6:
-                return -1e9 # Penalty for read failure
-            
-            vals = np.array(read[0:6])
-            
-            # Determine Logic
-            targets = get_expected_logic(op3, op2, op1, op0, c) # [0, 1, 1, 0...]
-            
-            # Calculate Margin for THIS instruction
-            # We want min(Highs) - max(Lows)
-            
-            high_volts = [vals[i] for i, t in enumerate(targets) if t == 1]
-            low_volts  = [vals[i] for i, t in enumerate(targets) if t == 0]
-            
-            if not high_volts: # Should not happen with valid ops
-                current_margin = -max(low_volts) # Just minimize noise
-            elif not low_volts:
-                current_margin = min(high_volts)
-            else:
-                # The core metric: Separation
-                current_margin = min(high_volts) - max(low_volts)
-            
-            margins.append(current_margin)
-            
-        # 3. Final Score = The Worst Case Margin across all instructions
-        # If the worst margin is positive, the decoder works for ALL instructions.
-        worst_case_margin = min(margins)
-        
-        # Softplus scaling to make GP happy (linear is fine too)
-        return float(worst_case_margin)
+        # Weights (Sum to 1.0)
+        W_ER = 0.6
+        W_STR = 0.2
+        W_CONS = 0.2
 
-    # ========================================================
-    #  BO Helpers
-    # ========================================================
+        instruction_scores = []
+        
+        for ops in self.test_ops: 
+            # Set Inputs
+            for k, h_inp in enumerate(INPUT_HEATERS):
+                self.controller.set(h_inp, V_LOW_LOGIC if ops[k] == 0 else V_HIGH_LOGIC)
+            
+            time.sleep(0.1) 
+            read = self.scopes.read_many(avg=1)
+            if read is None or len(read) < 6: return -2.0
+            
+            try:
+                vals = np.nan_to_num(np.array(read[0:6]), nan=0.0)
+                targets = np.array(get_expected_logic(*ops))
+                high_volts, low_volts = vals[targets == 1], vals[targets == 0]
+
+                if len(high_volts) == 0 or len(low_volts) == 0:
+                    instruction_scores.append(-1.0); continue
+
+                min_high = np.min(high_volts)
+                max_low  = np.max(low_volts)
+
+                # --- TARGET-BASED NORMALIZATION ---
+
+                # 1. Extinction/Gap Score (0.7 Weight)
+                # We target the actual separation gap. 
+                # If gap >= 2.5V, score approaches 1.0.
+                actual_gap = min_high - max_low
+                er_score = np.tanh(actual_gap / GAP_TARGET)
+                
+                # 2. Strength Score (0.2 Weight)
+                # Reward high absolute voltage. If min_high >= 3.5V, score approaches 1.0.
+                str_score = np.tanh(min_high / V_OH_TARGET)
+                
+                # 3. Low-Level Penalty (Integrated into consistency or as a gate)
+                # We want max_low to be as close to 0 as possible. 
+                # If max_low exceeds V_OL_TARGET, we reduce the consistency score.
+                low_penalty = np.exp(-max(0, max_low - V_OL_TARGET) / 0.5)
+                
+                variation = np.std(high_volts) + np.std(low_volts)
+                cons_score = np.exp(-variation / 0.4) * low_penalty
+
+                # Combine into final weighted FOM
+                fom = (W_ER * er_score) + (W_STR * str_score) + (W_CONS * cons_score)
+                instruction_scores.append(fom)
+
+            except Exception as e:
+                print(f"Error in math: {e}")
+                instruction_scores.append(-1.0)
+            
+        return float(np.min(instruction_scores))
+    
+    def fit_gp(self):
+        if len(self.X) < 10: return None
+        n_dims = len(MODIFIABLE_HEATERS)
+        kernel = (ConstantKernel(1.0) * Matern(length_scale=[2.0]*n_dims, nu=2.5) + 
+                  WhiteKernel(noise_level=1e-4))
+        gp = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=3, normalize_y=True)
+        gp.fit(np.array(self.X), np.array(self.y))
+        return gp
+
+    def explore_around_best(self, n_samples=15, radius=0.3):
+        """ The 'Hill-Climbing' strategy from your 2-bit code """
+        if self.best_config is None: return
+        print(f"\n--- Local Tweak around Best (Radius ±{radius}V) ---")
+        base_x = np.array(self.best_config)
+        
+        for i in range(n_samples):
+            # Tweak 15% of heaters randomly
+            indices = np.random.choice(len(MODIFIABLE_HEATERS), int(USE * 0.15), replace=False)
+            new_x = base_x.copy()
+            new_x[indices] += np.random.uniform(-radius, radius, len(indices))
+            new_x = np.clip(new_x, 0.1, 4.9)
+            
+            score = self.evaluate(new_x)
+            self.add_eval(new_x, score)
+            print(f"  Local {i+1}/{n_samples}: {score:.3f}")
+
     def add_eval(self, x, score):
         self.X.append(x)
         self.y.append(score)
         if score > self.best_score:
-            self.best_score = score
-            self.best_config = x
-            print(f"  ★ New Best: {score:.3f} V margin")
+            self.best_score, self.best_config = score, x
+            print(f"  ★ NEW BEST: {score:.3f}")
 
-    def fit_gp(self):
-        if len(self.X) < 5: return None
-        X_train = np.array(self.X)
-        y_train = np.array(self.y)
-        
-        # Robust Kernel for High Dimensions (44 dims!)
-        # Length scale needs to be large so it doesn't overfit noise
-        kernel = (
-            ConstantKernel(1.0) * Matern(length_scale=2.0, nu=2.5) + 
-            WhiteKernel(noise_level=0.01)
-        )
-        
-        gp = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=2, normalize_y=True)
-        gp.fit(X_train, y_train)
-        return gp
-
-    # ========================================================
-    #  Optimization Loop
-    # ========================================================
-    def optimize(self, iterations=30, candidates=500):
-        self.calibrate()
-        
-        print(f"\n=== Starting BO ({iterations} iters) ===")
-        # 1. Random Sampling
+    def optimize(self, total_cycles=20):
+        # 1. Initial Sampling
+        print("Starting Initial Latin Hypercube Sampling (50 samples)...")
         sampler = qmc.LatinHypercube(d=len(MODIFIABLE_HEATERS))
-        sample = sampler.random(n=5) # Start with 5 random points
-        
-        for i in range(5):
-            x = sample[i] * 4.8 + 0.1 # Scale 0-1 to 0.1-4.9
-            score = self.evaluate(x)
-            self.add_eval(x, score)
-            print(f"  [Init {i+1}] Score: {score:.3f}")
-            
-        # 2. GP Loop
-        for it in range(iterations):
-            print(f"Iter {it+1}: ", end="")
+        for x in (sampler.random(10) * 4.5 + 0.1):
+            self.add_eval(x, self.evaluate(x))
+
+        # 2. Main Hybrid Loop
+        for cycle in range(total_cycles):
+            print(f"\n=== Hybrid Cycle {cycle+1}/{total_cycles} ===")
             gp = self.fit_gp()
             
-            # Suggest Candidates (UCB)
-            # Generate random candidates
-            cand_X = np.random.uniform(0.1, 4.9, (candidates, len(MODIFIABLE_HEATERS)))
+            # --- INCREASED CANDIDATE DENSITY ---
+            # 80% random (Global), 20% near best (Local refinement)
+            n_cands = 1000 
+            cands_rand = np.random.uniform(0.1, 4.5, (int(n_cands*0.8), USE))
+            cands_local = np.clip(np.array(self.best_config) + np.random.normal(0, 0.4, (int(n_cands*0.2), USE)), 0.1, 4.9)
+            candidates = np.vstack([cands_rand, cands_local])
             
-            if gp:
-                mu, sigma = gp.predict(cand_X, return_std=True)
-                ucb = mu + 1.96 * sigma
-                best_idx = np.argmax(ucb)
-                next_x = cand_X[best_idx]
-            else:
-                next_x = cand_X[0]
+            # 3. EVALUATE A BATCH OF BO SUGGESTIONS
+            # This makes the BO work harder before the next Local Search
+            print(f"GP predicting {n_cands} candidates...")
             
-            # Evaluate
-            score = self.evaluate(next_x)
-            self.add_eval(next_x, score)
-            print(f"Score: {score:.3f}")
+            # Adaptive UCB (Exploration vs Exploitation)
+            beta = 3.0 if self.best_score < 0.4 else 2.5
+            mu, sigma = gp.predict(candidates, return_std=True)
+            ucb_values = mu + beta * sigma
             
-        # 3. Save
+            # Get the top 3 unique suggestions from the BO
+            best_indices = np.argsort(ucb_values)[-5:][::-1] 
+            
+            print(f"Evaluating top 3 BO suggestions (beta={beta})...")
+            for idx in best_indices:
+                suggestion = candidates[idx]
+                score = self.evaluate(suggestion)
+                self.add_eval(suggestion, score)
+                print(f"  BO Suggestion Score: {score:.3f}")
+
+            # 4. Trigger Local Search less frequently
+            # Now it only triggers every 3 cycles to give BO more 'room' to work
+            if (cycle + 1) % 3 == 0:
+                # Fewer local samples so it doesn't dominate the budget
+                self.explore_around_best(n_samples=5, radius=0.35)
+
         self.save_best()
 
     def save_best(self):
+        """
+        Saves the configuration in the specific 44-value list format.
+        Matches the structure: {"bg_weights": [...44 values...], "score": 0.0}
+        """
         if self.best_config is not None:
-            config_map = {
-                "bg_weights": self.best_config.tolist(),
-                "score": self.best_score
+            # 1. Convert the 44 optimized numpy values to a standard Python list
+            weights_list = self.best_config.tolist()
+            
+            # 2. Construct the exact dictionary structure you provided
+            output_data = {
+                "bg_weights": weights_list,
+                "score": float(self.best_score)
             }
-            with open("decoder_bo_config.json", "w") as f:
-                json.dump(config_map, f, indent=4)
-            print("\nSaved best config to decoder_bo_config.json")
-
-    def cleanup(self):
-        try: self.scopes.close()
-        except: pass
+            
+            # 3. Save to file
+            with open("decoder_hybrid_best.json", "w") as f:
+                json.dump(output_data, f, indent=4)
+            
+            print("\n" + "="*40)
+            print("Configuration saved!")
+            print(f"File: decoder_hybrid_best.json")
+            print(f"Final Score: {self.best_score:.6f}")
+            print("="*40)
 
 if __name__ == "__main__":
-    opt = DecoderBO()
-    try:
-        opt.optimize(iterations=100)
-    except KeyboardInterrupt:
-        print("\nStopping...")
-        opt.save_best()
-    finally:
-        opt.cleanup()
+    opt = HybridDecoderBO()
+    try: opt.optimize()
+    except KeyboardInterrupt: opt.save_best()
+    finally: opt.scopes.close()
