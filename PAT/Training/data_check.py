@@ -1,7 +1,7 @@
 import numpy as np
 
 # Load the dataset you uploaded
-data = np.load("chip_dataset.npz")
+data = np.load("full_chip_characterization.npz")
 X = data['X']
 y = data['y']
 
