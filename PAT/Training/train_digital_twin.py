@@ -6,7 +6,7 @@ import numpy as np
 
 # Use the same model class as before
 class ChipModel(nn.Module):
-    def __init__(self, num_heaters=49, num_outputs=6):
+    def __init__(self, num_heaters=21, num_outputs=7):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(num_heaters, 256),

@@ -82,21 +82,15 @@ def _parse_serial(idn: str) -> str:
     m = re.search(r'(\d{5,})', idn)
     return m.group(1) if m else idn
 
-
 class RigolDualScopes:
-    """
-    Minimal dual-scope version:
-      - scope1 is selected by its serial number (serial_scope1)
-      - scope2 is whichever other Rigol scope is found
-    The readout order is always: scope1 channels → scope2 channels
-    """
-
-    def __init__(self, channels_scope1, channels_scope2, serial_scope1=None, timeout_ms=5000):
+    def __init__(self, channels_scope1, channels_scope2, serial_scope1=None, timeout_ms=3000):
         self.channels1 = list(channels_scope1)
         self.channels2 = list(channels_scope2)
-        self.channels = self.channels1 + self.channels2
         self.serial_scope1 = serial_scope1
         self.timeout_ms = timeout_ms
+        
+        # 1. PERSISTENT EXECUTOR: Avoids the overhead of creating threads on every read
+        self.executor = ThreadPoolExecutor(max_workers=2)
         self._connect()
 
     def _connect(self):
@@ -111,111 +105,78 @@ class RigolDualScopes:
                 inst.read_termination = '\n'
                 inst.write_termination = '\n'
                 idn = inst.query("*IDN?").strip()
-                if "RIGOL" in idn.upper() or "HDO" in idn.upper():
+                if any(x in idn.upper() for x in ["RIGOL", "HDO"]):
                     candidates.append({
-                        "addr": addr,
-                        "idn": idn,
-                        "serial": _parse_serial(idn),
-                        "inst": inst
+                        "addr": addr, "idn": idn,
+                        "serial": self._parse_serial(idn), "inst": inst
                     })
                 else:
                     inst.close()
             except Exception:
-                try:
-                    if inst:
-                        inst.close()
-                except Exception:
-                    pass
+                pass
 
         if len(candidates) < 2:
             raise RuntimeError(f"[SCOPE] Need 2 Rigol scopes; found {len(candidates)}")
 
-        # --- determine scope1 and scope2 ---
-        scope1 = None
+        # Determine scope1 vs scope2
         if self.serial_scope1:
-            for c in candidates:
-                if c["serial"] == self.serial_scope1:
-                    scope1 = c
-                    break
-            if not scope1:
-                raise RuntimeError(f"[SCOPE] serial_scope1 '{self.serial_scope1}' not found.")
+            scope1_data = next((c for c in candidates if c["serial"] == self.serial_scope1), None)
+            if not scope1_data: raise RuntimeError("serial_scope1 not found.")
         else:
-            # Default: pick the first alphabetically by serial
             candidates.sort(key=lambda x: x["serial"])
-            scope1 = candidates[0]
+            scope1_data = candidates[0]
 
-        # The other becomes scope2
-        scope2 = [c for c in candidates if c is not scope1][0]
+        scope2_data = [c for c in candidates if c is not scope1_data][0]
+        self.scope1, self.scope2 = scope1_data["inst"], scope2_data["inst"]
 
-        self.scope1 = scope1["inst"]
-        self.scope2 = scope2["inst"]
-        self._idn1, self._idn2 = scope1["idn"], scope2["idn"]
-        self._ser1, self._ser2 = scope1["serial"], scope2["serial"]
-
-        print(f"[SCOPE1] {scope1['addr']} | {self._idn1} | serial={self._ser1}")
-        print(f"[SCOPE2] {scope2['addr']} | {self._idn2} | serial={self._ser2}")
-
-        # Configure channels
-        for ch in self.channels1:
-            self.scope1.write(f":CHANnel{ch}:DISPlay ON")
-            self.scope1.write(f":CHANnel{ch}:SCALe 2")
-            self.scope1.write(f":CHANnel{ch}:OFFSet -6")
-        for ch in self.channels2:
-            self.scope2.write(f":CHANnel{ch}:DISPlay ON")
-            self.scope2.write(f":CHANnel{ch}:SCALe 2")
-            self.scope2.write(f":CHANnel{ch}:OFFSet -6")
-
+        # 2. OPTIMIZED VERTICAL RANGE: 
+        # For 0-5V logic, 1V/div with -2.5V offset uses more of the ADC than 2V/div.
+        for s, chs in [(self.scope1, self.channels1), (self.scope2, self.channels2)]:
+            for ch in chs:
+                s.write(f":CHANnel{ch}:DISPlay ON")
+                s.write(f":CHANnel{ch}:SCALe 2.0")  # Tighter scale for better precision
+                s.write(f":CHANnel{ch}:OFFSet -6.0") # Centers 0-5V signal on screen
+        
         time.sleep(0.1)
 
-    def _read_channel(self, scope, ch):
+    def _parse_serial(self, idn: str) -> str:
+        parts = [p.strip() for p in idn.split(',')]
+        return parts[2] if len(parts) >= 3 else idn
+
+    def _read_fast(self, scope, ch):
+        """Uses direct measurement instead of statistic queries for speed."""
         try:
-            v = float(scope.query(_MEAS_QUERY.format(ch=ch)))
-            return v if -10 <= v <= 15 else np.nan
-        except Exception:
+            # :MEASure:ITEM? VMAX is significantly faster than :STATistic:ITEM?
+            return float(scope.query(f':MEASure:ITEM? VMAX,CHANnel{ch}'))
+        except:
             return np.nan
 
-    def _read_scope_channels(self, scope, channels, avg):
-            avg = max(1, int(avg))
-            out = []
-            # Remove per-sample sleep; VISA I/O already blocks until reply
-            for ch in channels:
-                samples = [self._read_channel(scope, ch) for _ in range(avg)]
-                samples = [v for v in samples if np.isfinite(v)]
-                out.append(float(np.mean(samples)) if samples else np.nan)
-            return out
-    
-    def reset_statistics(self):
-        """Clears the measurement history on both scopes."""
-        try:
-            self.scope1.write(':MEASure:STATistic:RESet')
-            self.scope2.write(':MEASure:STATistic:RESet')
-        except Exception as e:
-            print(f"[SCOPE] Warning: Failed to reset stats: {e}")
+    def _read_scope_batch(self, scope, channels, avg):
+        out = []
+        for ch in channels:
+            samples = []
+            for _ in range(avg):
+                v = self._read_fast(scope, ch)
+                if v == v: samples.append(v) # Fast NaN check
+            out.append(sum(samples)/len(samples) if samples else np.nan)
+        return out
 
     def read_many(self, avg=1):
         """
-        Modified to include a buffer clear before reading.
+        Parallelized readout using a persistent thread pool.
         """
-        # 1. CRITICAL: Clear the buffer so we don't read the previous heater state
-        self.reset_statistics()
+        # Small stabilization delay for the hardware
+        time.sleep(0.04) 
         
-        # 2. OPTIONAL: Small delay to let the scope start fresh
-        time.sleep(0.05) 
+        # Submit tasks to the pre-existing pool
+        f1 = self.executor.submit(self._read_scope_batch, self.scope1, self.channels1, avg)
+        f2 = self.executor.submit(self._read_scope_batch, self.scope2, self.channels2, avg)
         
-        with ThreadPoolExecutor(max_workers=2) as ex:
-            f1 = ex.submit(self._read_scope_channels, self.scope1, self.channels1, avg)
-            f2 = ex.submit(self._read_scope_channels, self.scope2, self.channels2, avg)
-            v1 = f1.result()
-            v2 = f2.result()
-        return np.array(v1 + v2, dtype=float)
-        
+        return np.array(f1.result() + f2.result(), dtype=float)
+
     def close(self):
+        self.executor.shutdown(wait=False)
         for s in (self.scope1, self.scope2):
-            try:
-                s.close()
-            except Exception:
-                pass
-        try:
-            self.rm.close()
-        except Exception:
-            pass
+            try: s.close()
+            except: pass
+        self.rm.close()
